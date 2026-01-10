@@ -4,6 +4,7 @@ import random
 import json
 import threading
 import telebot
+import pandas as pd
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import firebase_admin
@@ -15,14 +16,13 @@ from telebot import apihelper
 load_dotenv()
 
 # --- নেটওয়ার্ক স্ট্যাবিলিটি সেটিংস ---
-apihelper.SESSION_TIME_OUT = 120 # কানেকশন টাইমআউট বাড়ানো হলো
+apihelper.SESSION_TIME_OUT = 120
 
-# --- পোর্ট বাইন্ডিংয়ের জন্য Flask সেটআপ ---
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Bot is alive and scraping!", 200
+    return "Auto-Approve Bot is active!", 200
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -57,65 +57,86 @@ def save_to_firebase(group_data):
         print(f"Database Error: {e}")
         return False
 
-# --- স্ক্র্যাপিং ফাংশন ---
-def scrape_facebook(keyword, country):
+# --- অটো-অ্যাপ্রুভ চেক করার অ্যাডভান্সড ফাংশন ---
+def is_auto_approve(page, group_link):
+    try:
+        page.goto(group_link, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(3)
+        
+        # 'Write something' বা পোস্ট বক্স খোঁজা
+        post_box = page.get_by_text("Write something...", exact=False).or_(page.get_by_text("Create a public post...", exact=False))
+        
+        if post_box.is_visible():
+            post_box.click()
+            time.sleep(2)
+            
+            # এডমিন অ্যাপ্রুভাল টেক্সট চেক করা
+            content = page.content().lower()
+            if "submit a post for admin approval" in content or "posts must be approved by an admin" in content:
+                print(f"Skipping: {group_link} (Admin Approval Required)")
+                return False
+            else:
+                print(f"Match Found: {group_link} (Auto-Approve)")
+                return True
+        return False
+    except:
+        return False
+
+# --- স্ক্র্যাপিং ফাংশন (অটো-অ্যাপ্রুভ ফিল্টার সহ) ---
+def scrape_facebook(keyword, country, chat_id, bot_instance):
     results = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True, 
-            args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-gpu",
-                "--disable-notifications"
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = context.new_page()
 
         try:
-            # ফেসবুক লগইন (টাইমআউট ম্যানেজমেন্ট সহ)
-            page.goto("https://www.facebook.com/login", wait_until="domcontentloaded", timeout=90000)
+            # লগইন
+            page.goto("https://www.facebook.com/login", timeout=90000)
             page.fill("input[name='email']", FB_EMAIL)
             page.fill("input[name='pass']", FB_PASSWORD)
             page.click("button[name='login']")
-            time.sleep(10) # লগইন হওয়ার জন্য পর্যাপ্ত সময়
+            time.sleep(10)
 
+            # সার্চ
             search_url = f"https://www.facebook.com/search/groups/?q={keyword}"
-            page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
-            time.sleep(random.uniform(5, 8))
+            page.goto(search_url, timeout=90000)
+            
+            for _ in range(5): # স্ক্রলিং
+                page.mouse.wheel(0, 1000)
+                time.sleep(3)
 
-            # স্ক্রলিং বাড়ানো হয়েছে আরও বেশি ডাটার জন্য
-            for i in range(6): 
-                page.mouse.wheel(0, random.randint(900, 1500))
-                print(f"Scrolling page... {i+1}")
-                time.sleep(random.uniform(3, 6))
+            # সব গ্রুপ লিংক সংগ্রহ
+            links = page.locator("a[href*='/groups/']").all()
+            unique_links = []
+            for l in links:
+                href = l.get_attribute("href")
+                if href and "/groups/" in href:
+                    clean = href.split('?')[0].rstrip('/')
+                    if clean not in unique_links: unique_links.append(clean)
 
-            group_links = page.locator("a[href*='/groups/']").all()
-            seen_links = set()
-            for link_loc in group_links:
-                try:
-                    href = link_loc.get_attribute("href")
-                    if href and "/groups/" in href:
-                        clean_link = href.split('?')[0].rstrip('/')
-                        if clean_link not in seen_links:
-                            name = link_loc.inner_text().split('\n')[0]
-                            if name and len(name) > 2:
-                                results.append({
-                                    "name": name,
-                                    "link": clean_link,
-                                    "keyword": keyword,
-                                    "country": country,
-                                    "found_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                                })
-                                seen_links.add(clean_link)
-                except:
-                    continue
+            bot_instance.send_message(chat_id, f"🔍 মোট {len(unique_links)}টি গ্রুপ পাওয়া গেছে। এখন অটো-অ্যাপ্রুভ চেক করা হচ্ছে...")
+
+            # প্রতিটি গ্রুপ চেক করা
+            for link in unique_links[:20]: # প্রসেসিং লিমিট ২০টি (Render এর জন্য নিরাপদ)
+                name_loc = page.locator(f"a[href*='{link.split('/')[-1]}']").first
+                name = name_loc.inner_text().split('\n')[0] if name_loc.is_visible() else "FB Group"
+                
+                if is_auto_approve(page, link):
+                    data = {
+                        "name": name,
+                        "link": link,
+                        "keyword": keyword,
+                        "country": country,
+                        "type": "Auto-Approve",
+                        "found_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    if save_to_firebase(data):
+                        results.append(data)
+                        bot_instance.send_message(chat_id, f"✅ **Auto-Approve Found!**\n📌 {name}\n🔗 {link}", disable_web_page_preview=True)
+
         except Exception as e:
-            print(f"Scraping Error: {e}")
+            print(f"Error: {e}")
         finally:
             browser.close()
     return results
@@ -126,48 +147,46 @@ user_states = {}
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🚀 **FB Group Scraper Bot**\n\nপ্রথমে দেশের নাম লিখুন (যেমন: UK বা USA):")
+    bot.reply_to(message, "🚀 **Auto-Approve Scraper**\n\nপ্রথমে দেশের নাম লিখুন:")
+
+@bot.message_handler(commands=['export'])
+def export_data(message):
+    bot.send_message(message.chat.id, "📊 ডাটাবেস থেকে ফাইল তৈরি করা হচ্ছে...")
+    try:
+        ref = db.reference('groups')
+        data = ref.get()
+        if data:
+            df = pd.DataFrame(list(data.values()))
+            file_name = "fb_auto_approve_groups.csv"
+            df.to_csv(file_name, index=False)
+            with open(file_name, 'rb') as f:
+                bot.send_document(message.chat.id, f)
+            os.remove(file_name)
+        else:
+            bot.send_message(message.chat.id, "ডাটাবেস খালি!")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Error: {e}")
 
 @bot.message_handler(func=lambda m: m.chat.id not in user_states)
 def get_country(message):
     user_states[message.chat.id] = {'country': message.text}
-    bot.reply_to(message, f"দেশ: {message.text}\nএখন আপনার Niche বা Keyword লিখুন:")
+    bot.reply_to(message, "এখন আপনার Keyword লিখুন:")
 
 @bot.message_handler(func=lambda m: len(user_states.get(m.chat.id, {})) == 1)
 def get_keyword(message):
     chat_id = message.chat.id
     country = user_states[chat_id]['country']
     keyword = message.text
-    bot.send_message(chat_id, f"🔍 {country}-তে '{keyword}' এর গ্রুপ খোঁজা হচ্ছে। দয়া করে অপেক্ষা করুন...")
+    bot.send_message(chat_id, f"🔍 {keyword} এর অটো-অ্যাপ্রুভ গ্রুপ খোঁজা হচ্ছে। এটি কিছুটা সময় নেবে...")
     
-    try:
-        found_groups = scrape_facebook(keyword, country)
-        new_count = 0
-        if found_groups:
-            for g in found_groups:
-                if save_to_firebase(g):
-                    new_count += 1
-                    bot.send_message(chat_id, f"📌 **{g['name']}**\n🔗 {g['link']}", parse_mode="Markdown", disable_web_page_preview=True)
-            bot.send_message(chat_id, f"✅ কাজ শেষ! {new_count}টি নতুন গ্রুপ পাওয়া গেছে।")
-        else:
-            bot.send_message(chat_id, "দুঃখিত, কোনো নতুন গ্রুপ খুঁজে পাওয়া যায়নি।")
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ স্ক্র্যাপিংয়ে সমস্যা হয়েছে: {str(e)}")
-    
-    if chat_id in user_states:
-        del user_states[chat_id]
+    scrape_facebook(keyword, country, chat_id, bot)
+    bot.send_message(chat_id, "✅ স্ক্র্যাপিং শেষ হয়েছে।")
+    del user_states[chat_id]
 
-# --- মেইন এক্সিকিউশন (কানেকশন এরর হ্যান্ডলিং সহ) ---
 if __name__ == "__main__":
-    # Flask সার্ভার থ্রেড
     threading.Thread(target=run_web_server, daemon=True).start()
-    
-    print("Bot is starting and ready for action...")
-    
     while True:
         try:
-            # non_stop=True দেওয়া হয়েছে যাতে এরর আসলেও বট বন্ধ না হয়
             bot.polling(non_stop=True, interval=2, timeout=120)
-        except Exception as e:
-            print(f"Polling error occurred: {e}")
-            time.sleep(10) # ১০ সেকেন্ড বিরতি দিয়ে আবার কানেক্ট করবে
+        except:
+            time.sleep(10)
