@@ -2,7 +2,9 @@ import os
 import time
 import random
 import json
+import threading
 import telebot
+from flask import Flask
 from playwright.sync_api import sync_playwright
 import firebase_admin
 from firebase_admin import credentials, db
@@ -10,6 +12,18 @@ from dotenv import load_dotenv
 
 # এনভায়রনমেন্ট ভেরিয়েবল লোড করা
 load_dotenv()
+
+# --- পোর্ট বাইন্ডিংয়ের জন্য Flask সেটআপ ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is running perfectly!", 200
+
+def run_web_server():
+    # Render অটোমেটিক PORT এনভায়রনমেন্ট ভেরিয়েবল প্রদান করে, না থাকলে ১০০০০ ব্যবহার করবে
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 # --- কনফিগারেশন ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -40,11 +54,10 @@ def save_to_firebase(group_data):
         print(f"Database Error: {e}")
         return False
 
-# --- স্ক্র্যাপিং ফাংশন (Render Optimized) ---
+# --- স্ক্র্যাপিং ফাংশন ---
 def scrape_facebook(keyword, country):
     results = []
     with sync_playwright() as p:
-        # Render-এর সীমাবদ্ধ মেমরি এবং লিনাক্স এনভায়রনমেন্টের জন্য আর্গুমেন্ট
         browser = p.chromium.launch(
             headless=True, 
             args=[
@@ -61,25 +74,20 @@ def scrape_facebook(keyword, country):
         page = context.new_page()
 
         try:
-            # ফেসবুক লগইন
             page.goto("https://www.facebook.com/login", wait_until="domcontentloaded", timeout=60000)
             page.fill("input[name='email']", FB_EMAIL)
             page.fill("input[name='pass']", FB_PASSWORD)
             page.click("button[name='login']")
             time.sleep(7) 
 
-            # সার্চ ইউআরএল
             search_url = f"https://www.facebook.com/search/groups/?q={keyword}"
             page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
             time.sleep(random.uniform(5, 8))
 
-            # স্ক্রলিং
             for i in range(4):
                 page.mouse.wheel(0, random.randint(800, 1200))
-                print(f"Scrolling {i+1}...")
                 time.sleep(random.uniform(3, 5))
 
-            # ডাটা এক্সট্রাকশন
             group_links = page.locator("a[href*='/groups/']").all()
             seen_links = set()
             for link_loc in group_links:
@@ -124,7 +132,6 @@ def get_keyword(message):
     chat_id = message.chat.id
     country = user_states[chat_id]['country']
     keyword = message.text
-    
     bot.send_message(chat_id, f"🔍 {country}-তে '{keyword}' এর গ্রুপ খোঁজা হচ্ছে...")
     
     try:
@@ -144,5 +151,16 @@ def get_keyword(message):
     if chat_id in user_states:
         del user_states[chat_id]
 
+# --- মেইন এক্সিকিউশন ---
 if __name__ == "__main__":
-    bot.infinity_polling()
+    # ওয়েব সার্ভারটি আলাদা থ্রেডে চালানো যাতে বটের কাজে বাধা না দেয়
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    print("Bot is starting...")
+    # পলিং যেন ক্র্যাশ না করে সেজন্য লুপ ব্যবহার করা হয়েছে
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
