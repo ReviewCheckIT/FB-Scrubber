@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+playwright
+firebase-admin
+python-dotenv
