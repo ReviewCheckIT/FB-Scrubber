@@ -9,19 +9,22 @@ from playwright.sync_api import sync_playwright
 import firebase_admin
 from firebase_admin import credentials, db
 from dotenv import load_dotenv
+from telebot import apihelper
 
 # এনভায়রনমেন্ট ভেরিয়েবল লোড করা
 load_dotenv()
+
+# --- নেটওয়ার্ক স্ট্যাবিলিটি সেটিংস ---
+apihelper.SESSION_TIME_OUT = 120 # কানেকশন টাইমআউট বাড়ানো হলো
 
 # --- পোর্ট বাইন্ডিংয়ের জন্য Flask সেটআপ ---
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Bot is running perfectly!", 200
+    return "Bot is alive and scraping!", 200
 
 def run_web_server():
-    # Render অটোমেটিক PORT এনভায়রনমেন্ট ভেরিয়েবল প্রদান করে, না থাকলে ১০০০০ ব্যবহার করবে
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
@@ -69,24 +72,27 @@ def scrape_facebook(keyword, country):
             ]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
         try:
-            page.goto("https://www.facebook.com/login", wait_until="domcontentloaded", timeout=60000)
+            # ফেসবুক লগইন (টাইমআউট ম্যানেজমেন্ট সহ)
+            page.goto("https://www.facebook.com/login", wait_until="domcontentloaded", timeout=90000)
             page.fill("input[name='email']", FB_EMAIL)
             page.fill("input[name='pass']", FB_PASSWORD)
             page.click("button[name='login']")
-            time.sleep(7) 
+            time.sleep(10) # লগইন হওয়ার জন্য পর্যাপ্ত সময়
 
             search_url = f"https://www.facebook.com/search/groups/?q={keyword}"
-            page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
             time.sleep(random.uniform(5, 8))
 
-            for i in range(4):
-                page.mouse.wheel(0, random.randint(800, 1200))
-                time.sleep(random.uniform(3, 5))
+            # স্ক্রলিং বাড়ানো হয়েছে আরও বেশি ডাটার জন্য
+            for i in range(6): 
+                page.mouse.wheel(0, random.randint(900, 1500))
+                print(f"Scrolling page... {i+1}")
+                time.sleep(random.uniform(3, 6))
 
             group_links = page.locator("a[href*='/groups/']").all()
             seen_links = set()
@@ -132,7 +138,7 @@ def get_keyword(message):
     chat_id = message.chat.id
     country = user_states[chat_id]['country']
     keyword = message.text
-    bot.send_message(chat_id, f"🔍 {country}-তে '{keyword}' এর গ্রুপ খোঁজা হচ্ছে...")
+    bot.send_message(chat_id, f"🔍 {country}-তে '{keyword}' এর গ্রুপ খোঁজা হচ্ছে। দয়া করে অপেক্ষা করুন...")
     
     try:
         found_groups = scrape_facebook(keyword, country)
@@ -144,23 +150,24 @@ def get_keyword(message):
                     bot.send_message(chat_id, f"📌 **{g['name']}**\n🔗 {g['link']}", parse_mode="Markdown", disable_web_page_preview=True)
             bot.send_message(chat_id, f"✅ কাজ শেষ! {new_count}টি নতুন গ্রুপ পাওয়া গেছে।")
         else:
-            bot.send_message(chat_id, "কোনো গ্রুপ খুঁজে পাওয়া যায়নি।")
+            bot.send_message(chat_id, "দুঃখিত, কোনো নতুন গ্রুপ খুঁজে পাওয়া যায়নি।")
     except Exception as e:
-        bot.send_message(chat_id, f"❌ সমস্যা: {str(e)}")
+        bot.send_message(chat_id, f"❌ স্ক্র্যাপিংয়ে সমস্যা হয়েছে: {str(e)}")
     
     if chat_id in user_states:
         del user_states[chat_id]
 
-# --- মেইন এক্সিকিউশন ---
+# --- মেইন এক্সিকিউশন (কানেকশন এরর হ্যান্ডলিং সহ) ---
 if __name__ == "__main__":
-    # ওয়েব সার্ভারটি আলাদা থ্রেডে চালানো যাতে বটের কাজে বাধা না দেয়
+    # Flask সার্ভার থ্রেড
     threading.Thread(target=run_web_server, daemon=True).start()
     
-    print("Bot is starting...")
-    # পলিং যেন ক্র্যাশ না করে সেজন্য লুপ ব্যবহার করা হয়েছে
+    print("Bot is starting and ready for action...")
+    
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+            # non_stop=True দেওয়া হয়েছে যাতে এরর আসলেও বট বন্ধ না হয়
+            bot.polling(non_stop=True, interval=2, timeout=120)
         except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(5)
+            print(f"Polling error occurred: {e}")
+            time.sleep(10) # ১০ সেকেন্ড বিরতি দিয়ে আবার কানেক্ট করবে
