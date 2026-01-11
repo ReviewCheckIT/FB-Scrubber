@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import json
 import threading
 import telebot
@@ -9,28 +10,32 @@ from playwright.sync_api import sync_playwright
 import firebase_admin
 from firebase_admin import credentials, db
 from dotenv import load_dotenv
+from telebot import apihelper
 
-# এনভায়রনমেন্ট ভেরিয়েবল লোড করা
+# এনভায়রনমেন্ট ভেরিয়েবল লোড করা
 load_dotenv()
+
+# --- নেটওয়ার্ক স্ট্যাবিলিটি সেটিংস ---
+apihelper.SESSION_TIME_OUT = 120
 
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "ফেসবুক স্ক্র্যাপার বট রান করছে!", 200
+    return "Auto-Approve Bot is active!", 200
 
 def run_web_server():
-    # Render সাধারণত 10000 পোর্টে রান করে
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # --- কনফিগারেশন ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FB_COOKIES_JSON = os.getenv("FB_COOKIES") # Render থেকে এই কুকি লোড হবে
+FB_EMAIL = os.getenv("FB_EMAIL")
+FB_PASSWORD = os.getenv("FB_PASSWORD")
 FIREBASE_JSON = os.getenv("FIREBASE_CREDENTIALS")
 DB_URL = os.getenv("DB_URL")
 
-# ফায়ারবেস ডাটাবেস ইনিশিয়ালাইজেশন
+# --- ফায়ারবেস ইনিশিয়ালাইজেশন ---
 if FIREBASE_JSON:
     try:
         cred_dict = json.loads(FIREBASE_JSON)
@@ -40,216 +45,148 @@ if FIREBASE_JSON:
     except Exception as e:
         print(f"Firebase Init Error: {e}")
 
-def save_to_firebase(group_data, category):
+def save_to_firebase(group_data):
     try:
-        ref = db.reference(f'groups/{category}')
-        # লিংকে ইনভ্যালিড ক্যারেক্টার থাকলে ফায়ারবেস পাথ এরর দেয়, তাই ক্লিন করা হচ্ছে
-        safe_key = "".join(filter(str.isalnum, group_data['link']))
-        ref.child(safe_key).set(group_data)
-        return True
+        ref = db.reference('groups')
+        safe_key = group_data['link'].replace('.', '_').replace('/', '|').replace(':', '')
+        if not ref.child(safe_key).get():
+            ref.child(safe_key).set(group_data)
+            return True
+        return False
     except Exception as e:
         print(f"Database Error: {e}")
         return False
 
-# --- গ্রুপের বিস্তারিত তথ্য সংগ্রহ ---
-def get_group_details(page, group_link):
-    details = {
-        "status": "অজানা",
-        "members": "পাওয়া যায়নি",
-        "admin_link": "পাওয়া যায়নি",
-        "name": "FB Group",
-        "is_auto": False
-    }
+# --- অটো-অ্যাপ্রুভ চেক করার অ্যাডভান্সড ফাংশন ---
+def is_auto_approve(page, group_link):
     try:
         page.goto(group_link, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(4)
-
-        # গ্রুপের নাম সংগ্রহ
-        details["name"] = page.title().split('|')[0].strip()
+        time.sleep(3)
         
-        # মেম্বার সংখ্যা ডিটেকশন
-        member_selectors = ["span:has-text('members')", "span:has-text('সদস্য')", "a[href*='members']"]
-        for s in member_selectors:
-            try:
-                elem = page.locator(s).first
-                if elem.is_visible():
-                    details["members"] = elem.inner_text()
-                    break
-            except: continue
-
-        # অটো-এপ্রুভ চেক
-        # পাবলিক গ্রুপে পোস্ট করার অপশন চেক করা হচ্ছে
-        post_selectors = ["Write something...", "Create a public post...", "কিছু লিখুন..."]
-        found_box = False
-        for selector in post_selectors:
-            try:
-                target = page.get_by_text(selector).first
-                if target.is_visible():
-                    target.click()
-                    found_box = True
-                    break
-            except: continue
+        # 'Write something' বা পোস্ট বক্স খোঁজা
+        post_box = page.get_by_text("Write something...", exact=False).or_(page.get_by_text("Create a public post...", exact=False))
         
-        if found_box:
+        if post_box.is_visible():
+            post_box.click()
             time.sleep(2)
-            page_content = page.content().lower()
-            # এডমিন এপ্রুভালের কোনো টেক্সট আছে কিনা যাচাই
-            if any(word in page_content for word in ["admin approval", "approving posts", "অ্যাডমিন অনুমোদন", "review post"]):
-                details["status"] = "❌ এডমিন এপ্রুভাল প্রয়োজন"
-                details["is_auto"] = False
+            
+            # এডমিন অ্যাপ্রুভাল টেক্সট চেক করা
+            content = page.content().lower()
+            if "submit a post for admin approval" in content or "posts must be approved by an admin" in content:
+                print(f"Skipping: {group_link} (Admin Approval Required)")
+                return False
             else:
-                details["status"] = "✅ অটো-এপ্রুভ"
-                details["is_auto"] = True
-            # পোস্ট বক্স বন্ধ করা
-            page.keyboard.press("Escape")
-        else:
-            details["status"] = "🔒 প্রাইভেট বা সীমাবদ্ধ"
+                print(f"Match Found: {group_link} (Auto-Approve)")
+                return True
+        return False
+    except:
+        return False
 
-        # এডমিন লিংক খোঁজা
-        try:
-            page.goto(f"{group_link}/about", wait_until="domcontentloaded", timeout=30000)
-            admin_loc = page.locator("a[href*='/user/'], a[href*='profile.php']").first
-            if admin_loc.is_visible():
-                details["admin_link"] = "https://facebook.com" + admin_loc.get_attribute("href").split('?')[0]
-        except: pass
-
-    except Exception as e:
-        print(f"Detail Fetch Error: {e}")
-    
-    return details
-
-# --- মেইন স্ক্র্যাপিং ফাংশন ---
+# --- স্ক্র্যাপিং ফাংশন (অটো-অ্যাপ্রুভ ফিল্টার সহ) ---
 def scrape_facebook(keyword, country, chat_id, bot_instance):
+    results = []
     with sync_playwright() as p:
-        # রেন্ডারের জন্য ব্রাউজার অপশন
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        )
-        
-        # কুকি ফাইল বা ভেরিয়েবল থেকে কুকি যুক্ত করা
-        if FB_COOKIES_JSON:
-            try:
-                cookies = json.loads(FB_COOKIES_JSON)
-                context.add_cookies(cookies)
-            except Exception as e:
-                bot_instance.send_message(chat_id, f"❌ কুকি ফরম্যাটে সমস্যা: {e}")
-                return
-        else:
-            bot_instance.send_message(chat_id, "❌ Render-এ 'FB_COOKIES' ভেরিয়েবল সেট করা নেই!")
-            return
-
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = context.new_page()
 
         try:
-            # কুকি কাজ করছে কিনা পরীক্ষা করা
-            page.goto("https://www.facebook.com/profile.php", timeout=60000)
-            if "login" in page.url:
-                bot_instance.send_message(chat_id, "❌ কুকি কাজ করছে না! সম্ভবত এটি এক্সপায়ার হয়ে গেছে। নতুন কুকি দিন।")
-                return
+            # লগইন
+            page.goto("https://www.facebook.com/login", timeout=90000)
+            page.fill("input[name='email']", FB_EMAIL)
+            page.fill("input[name='pass']", FB_PASSWORD)
+            page.click("button[name='login']")
+            time.sleep(10)
 
-            # সার্চ প্রসেস
-            search_query = f"{keyword} {country}"
-            bot_instance.send_message(chat_id, f"🔍 '{search_query}' দিয়ে সার্চ করা হচ্ছে...")
-            page.goto(f"https://www.facebook.com/search/groups/?q={search_query}", timeout=60000)
+            # সার্চ
+            search_url = f"https://www.facebook.com/search/groups/?q={keyword}"
+            page.goto(search_url, timeout=90000)
             
-            # কয়েকবার স্ক্রল ডাউন করা যাতে বেশি গ্রুপ পাওয়া যায়
-            for _ in range(3):
+            for _ in range(5): # স্ক্রলিং
                 page.mouse.wheel(0, 1000)
-                time.sleep(2)
+                time.sleep(3)
 
-            # গ্রুপ লিংক সংগ্রহ
-            elements = page.locator("a[href*='/groups/']").all()
-            links_to_process = []
-            for e in elements:
-                href = e.get_attribute("href")
+            # সব গ্রুপ লিংক সংগ্রহ
+            links = page.locator("a[href*='/groups/']").all()
+            unique_links = []
+            for l in links:
+                href = l.get_attribute("href")
                 if href and "/groups/" in href:
-                    clean_link = href.split('?')[0].rstrip('/')
-                    if clean_link not in links_to_process and "/user/" not in clean_link:
-                        links_to_process.append(clean_link)
+                    clean = href.split('?')[0].rstrip('/')
+                    if clean not in unique_links: unique_links.append(clean)
 
-            bot_instance.send_message(chat_id, f"✅ মোট {len(links_to_process)}টি গ্রুপ পাওয়া গেছে। ফিল্টারিং শুরু হচ্ছে...")
+            bot_instance.send_message(chat_id, f"🔍 মোট {len(unique_links)}টি গ্রুপ পাওয়া গেছে। এখন অটো-অ্যাপ্রুভ চেক করা হচ্ছে...")
 
-            # ডিটেইলস স্ক্র্যাপিং শুরু
-            for link in links_to_process[:15]: # লোড কমাতে শুরুতে ১৫টি লিমিট করা হয়েছে
-                info = get_group_details(page, link)
-                data = {
-                    "name": info["name"],
-                    "link": link,
-                    "members": info["members"],
-                    "status": info["status"],
-                    "admin": info["admin_link"],
-                    "keyword": keyword,
-                    "found_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                }
+            # প্রতিটি গ্রুপ চেক করা
+            for link in unique_links[:20]: # প্রসেসিং লিমিট ২০টি (Render এর জন্য নিরাপদ)
+                name_loc = page.locator(f"a[href*='{link.split('/')[-1]}']").first
+                name = name_loc.inner_text().split('\n')[0] if name_loc.is_visible() else "FB Group"
                 
-                # অটো-এপ্রুভ অনুযায়ী ক্যাটাগরি করা
-                category = "auto_approve" if info["is_auto"] else "admin_approve"
-                save_to_firebase(data, category)
-                
-                # রেজাল্ট মেসেজ
-                msg = (f"📂 **{data['name']}**\n"
-                       f"👥 সদস্য: {data['members']}\n"
-                       f"🛠 অবস্থা: {data['status']}\n"
-                       f"🔗 লিংক: {data['link']}\n"
-                       f"👤 এডমিন: {data['admin']}")
-                bot_instance.send_message(chat_id, msg, disable_web_page_preview=True)
+                if is_auto_approve(page, link):
+                    data = {
+                        "name": name,
+                        "link": link,
+                        "keyword": keyword,
+                        "country": country,
+                        "type": "Auto-Approve",
+                        "found_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    if save_to_firebase(data):
+                        results.append(data)
+                        bot_instance.send_message(chat_id, f"✅ **Auto-Approve Found!**\n📌 {name}\n🔗 {link}", disable_web_page_preview=True)
 
         except Exception as e:
-            bot_instance.send_message(chat_id, f"❌ স্ক্র্যাপিং এরর: {str(e)}")
+            print(f"Error: {e}")
         finally:
             browser.close()
+    return results
 
-# --- টেলিগ্রাম হ্যান্ডলার ---
+# --- টেলিগ্রাম বট লজিক ---
 bot = telebot.TeleBot(BOT_TOKEN)
 user_states = {}
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🚀 **FB Group Scraper (Cookie Version)**\n\nপ্রথমে দেশের নাম দিন (যেমন: USA):")
+    bot.reply_to(message, "🚀 **Auto-Approve Scraper**\n\nপ্রথমে দেশের নাম লিখুন:")
 
 @bot.message_handler(commands=['export'])
 def export_data(message):
+    bot.send_message(message.chat.id, "📊 ডাটাবেস থেকে ফাইল তৈরি করা হচ্ছে...")
     try:
         ref = db.reference('groups')
         data = ref.get()
-        if not data:
-            bot.send_message(message.chat.id, "ডাটাবেস এখন খালি!")
-            return
-            
-        all_records = []
-        for cat in ['auto_approve', 'admin_approve']:
-            if cat in data:
-                for key in data[cat]:
-                    record = data[cat][key]
-                    record['Category'] = cat
-                    all_records.append(record)
-        
-        df = pd.DataFrame(all_records)
-        df.to_csv("facebook_leads.csv", index=False)
-        with open("facebook_leads.csv", 'rb') as f:
-            bot.send_document(message.chat.id, f, caption="✅ সকল গ্রুপের ডাটা এক্সপোর্ট করা হয়েছে।")
+        if data:
+            df = pd.DataFrame(list(data.values()))
+            file_name = "fb_auto_approve_groups.csv"
+            df.to_csv(file_name, index=False)
+            with open(file_name, 'rb') as f:
+                bot.send_document(message.chat.id, f)
+            os.remove(file_name)
+        else:
+            bot.send_message(message.chat.id, "ডাটাবেস খালি!")
     except Exception as e:
-        bot.send_message(message.chat.id, f"এক্সপোর্ট এরর: {e}")
+        bot.send_message(message.chat.id, f"Error: {e}")
 
 @bot.message_handler(func=lambda m: m.chat.id not in user_states)
 def get_country(message):
     user_states[message.chat.id] = {'country': message.text}
-    bot.reply_to(message, "এখন কি-ওয়ার্ড দিন (যেমন: Marketplace):")
+    bot.reply_to(message, "এখন আপনার Keyword লিখুন:")
 
 @bot.message_handler(func=lambda m: len(user_states.get(m.chat.id, {})) == 1)
 def get_keyword(message):
     chat_id = message.chat.id
     country = user_states[chat_id]['country']
     keyword = message.text
-    bot.send_message(chat_id, f"⏳ কাজ শুরু হয়েছে... একটু অপেক্ষা করুন।")
+    bot.send_message(chat_id, f"🔍 {keyword} এর অটো-অ্যাপ্রুভ গ্রুপ খোঁজা হচ্ছে। এটি কিছুটা সময় নেবে...")
     
-    # আলাদা থ্রেডে রান করা যাতে বট হ্যাং না হয়
-    threading.Thread(target=scrape_facebook, args=(keyword, country, chat_id, bot)).start()
+    scrape_facebook(keyword, country, chat_id, bot)
+    bot.send_message(chat_id, "✅ স্ক্র্যাপিং শেষ হয়েছে।")
     del user_states[chat_id]
 
 if __name__ == "__main__":
-    # ওয়েব সার্ভার ব্যাকগ্রাউন্ডে চালানো
     threading.Thread(target=run_web_server, daemon=True).start()
-    print("Bot is starting with Cookie Support...")
-    bot.infinity_polling()
+    while True:
+        try:
+            bot.polling(non_stop=True, interval=2, timeout=120)
+        except:
+            time.sleep(10)
